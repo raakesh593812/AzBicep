@@ -1,0 +1,35 @@
+parameters:
+  environmentName: ''
+  location: ''
+  appPrefix: ''
+  subscriptionId: ''
+  serviceConnection: ''
+  vmImage: ''
+  
+
+jobs:
+  - job: Deploy
+    displayName: 'Deploy Core'
+    pool:
+      vmImage: $(vmImage)
+    steps:
+    - task: DownloadBuildArtifacts@0
+      displayName: 'Download artifacts'
+      inputs:
+        buildType: 'current'
+        downloadType: 'single'
+        artifactName: 'martech'
+        downloadPath: '$(Build.ArtifactsDirectory)'
+
+
+    - task: AzureResourceManagerTemplateDeployment@3
+      displayName: 'Deploy core infra'
+      inputs:
+        deploymentScope: 'Subscription'
+        azureResourceManagerConnection: '$(serviceConnection)'
+        subscriptionId: '$(subscriptionId)'
+        location: '${{ parameters.location }}'
+        templateLocation: 'Linked artifact'
+        csmFile: '$(Build.ArtifactsDirectory)/martech/recoveryvault.json'
+        overrideParameters: '-environmentName "$(environmentName)" -region "${{ parameters.location }}" -appPrefix "${{ parameters.appPrefix }}"'
+        deploymentMode: 'Incremental'
