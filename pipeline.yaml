@@ -1,0 +1,273 @@
+name: ${{ parameters.component }}-${{ parameters.environment }}-$(Date:yyyy-MM-dd) [$(BuildId)]
+
+parameters:
+  - name: environment
+    displayName: Environment Name
+    type: string
+    default: -- SELECT --
+    values:
+      - -- SELECT --
+      - dev
+      - uat
+      - prod
+
+  - name: initialize
+    displayName: Initialize Environment
+    type: boolean
+    default: false
+    values:
+      - true
+      - false
+
+  - name: component
+    displayName: Component to deploy
+    type: string
+    default: -- SELECT --
+    values:
+      - -- SELECT --
+      - full
+      - core
+      - app
+      - rvs
+
+variables:
+- template: pipeline.variables.yaml
+
+- ${{ if eq(parameters.environment, 'prod') }}:
+  - template: ../.config/global.prod.yaml
+- ${{ elseif eq(parameters.environment, 'uat') }}:
+  - template: ../.config/global.uat.yaml
+- ${{ else }}:
+  - template: ../.config/global.dev.yaml
+
+trigger: none
+
+stages:
+  # ######## PRE DEPLOYMENT ########
+  # Validate deployment from appropriate branch
+  # UAT and PROD environments can only be deployed form main branch
+  # DEV environment can be deployed from any branch
+  - stage: PreDeploy
+    displayName: Pre Check
+    jobs:
+      - job: Checks
+        steps:
+        - checkout: none
+        - task: PowerShell@2
+          displayName: Validate deployment environment
+          inputs:
+            targetType: 'inline'
+            script: |
+              if( ('$(Build.SourceBranchName)' -ne 'main') -and ('${{ parameters.environment }}' -eq 'prod') ) {
+                Write-Host "##vso[task.logissue type=error;]Only main branch can be deployed to PROD"
+                Write-Host "##vso[task.complete result=Failed;]"
+              }
+              elseif( ('$(Build.SourceBranchName)' -ne 'main') -and ('${{ parameters.environment }}' -eq 'uat') ) {
+                Write-Host "##vso[task.logissue type=error;]Only main branch can be deployed to UAT - feature branches are not allowed"
+                Write-Host "##vso[task.complete result=Failed;]"
+              }
+              else {
+                Write-Host "##[debug]Deployment will now begin to environment - '${{ parameters.environment }}'"
+              }
+
+  # ######## BUILD ########
+  # Install Az bicep
+  # Build bicep files
+  # Stage all artifacts for deployment
+  - stage: Build
+    dependsOn: PreDeploy
+    condition: succeeded()
+    jobs:
+      - template: templates/pipeline.jobs.build.yaml
+
+  # ######## INITIALIZE ########
+  # Initialize environment by enabling resource providers if needed - OPTIONAL 
+  - stage: Initialize
+    displayName: Initialize ${{ parameters.environment }} environment
+    dependsOn: PreDeploy
+    condition: eq('${{ parameters.initialize }}', 'true')
+    jobs:
+      - template: templates/pipeline.jobs.init.yaml
+
+  # ######## DEPLOY CORE INFRA ########
+  # Deploy Core infrastructure - networking 
+  - stage: Deploy_Core
+    displayName: Deploy core infra
+    condition: in('${{ parameters.component }}', 'core', 'full')
+    dependsOn:
+    - PreDeploy
+    - Build
+    - Initialize
+    jobs:
+      - template: templates/pipeline.jobs.core.yaml
+        parameters:
+          environmentName: "$(environmentName)"
+          location: "$(region)"
+          appPrefix: "$(appPrefix)"
+          subscriptionId: "$(subscriptionId)"
+          serviceConnection: "$(serviceConnection)"
+          vmImage: "$(vmImage)"
+          spokeVnetAddressSpace: "$(spokeVnetAddressSpace)"
+          firewallIpAddress: "$(firewallIpAddress)"
+          devopsSubnetAddressPrefix: "$(devopsSubnetAddressPrefix)"
+          azServicesSubnetAddressPrefix: "$(azServicesSubnetAddressPrefix)"
+          restrictedDatabricksPrivateSubnetAddressPrefix: "$(restrictedDatabricksPrivateSubnetAddressPrefix)"
+          restrictedDatabricksPublicSubnetAddressPrefix: "$(restrictedDatabricksPublicSubnetAddressPrefix)"
+          unrestrictedDatabricksPrivateSubnetAddressPrefix: "$(unrestrictedDatabricksPrivateSubnetAddressPrefix)"
+          unrestrictedDatabricksPublicSubnetAddressPrefix: "$(unrestrictedDatabricksPublicSubnetAddressPrefix)"      
+          accIaaSSubnetAddressPrefix: "$(accIaaSSubnetAddressPrefix)"
+          legacyIaaSSubnetAddressPrefix: "$(legacyIaaSSubnetAddressPrefix)"
+
+  ######## DEPLOY APP INFRA ########
+  # Deploy application infrastructure - databricks, datafactory, key vaults, storage ..etc
+  - stage: Deploy_App
+    displayName: Deploy app infra
+    condition: |
+      and
+      (
+        in('${{ parameters.component }}', 'app', 'full'),
+        in(dependencies.Deploy_Core.result, 'Succeeded', 'Skipped'),
+        eq(dependencies.PreDeploy.result, 'Succeeded')
+      )
+    dependsOn:
+    - PreDeploy
+    - Build
+    - Initialize
+    - Deploy_Core
+    jobs:
+      - template: templates/pipeline.jobs.app.yaml
+        parameters:
+          appPrefix: "$(appPrefix)"
+          environmentName: "$(environmentName)"
+          location: "$(region)"
+          keyVaultAADObjectId: "$(keyVaultAADObjectId)"
+          serviceConnection: "$(serviceConnection)"
+          subscriptionId: "$(subscriptionId)"
+          vmImage: "$(vmImage)"
+          voltageUrl: "$(voltageUrl)"
+          restrictedDatabricksServicePrincipal: "$(restrictedDatabricksServicePrincipal)"
+          unrestrictedDatabricksServicePrincipal: "$(unrestrictedDatabricksServicePrincipal)"
+          oracleVMName: "$(oracleVmName)"
+          oracleVMDataDrives: "$(oracleVMDataDrives)"
+
+  # ######## POST DEPLOYMENT ########
+  # Validate Databricks has access to all key vaults access policy
+  # Validate diagnostic logging is enabled on resources that supports it
+  - stage: PostDeploy
+    pool:
+      vmImage: $(vmImage)
+    displayName: Post deploy
+    condition: |
+      and
+      (
+        eq(dependencies.PreDeploy.result, 'Succeeded'),
+        in(dependencies.Deploy_Core.result, 'Succeeded', 'Skipped'),
+        in(dependencies.Deploy_App.result, 'Succeeded', 'Skipped')
+      )
+    #condition: eq('${{ parameters.executionType }}', 'PostDeploy')
+    dependsOn:
+    - Deploy_Core
+    - Deploy_App
+    jobs:
+      - job: Configuration
+        steps:
+        - checkout: none
+        - task: AzurePowerShell@5
+          displayName: Databricks - KV Access Policy
+          inputs:
+            azureSubscription: '$(serviceConnection)'
+            ScriptType: 'InlineScript'
+            Inline: |
+              # Get only kv-01 and kv-02 - DevOps key vault is excluded ${env}-martech-devops-kv-01
+              $vaults = Get-AzKeyVault | Where-Object { $_.VaultName -like "${{ parameters.environment }}-$(appPrefix)-kv-*" }
+              foreach ($vault in $vaults) {
+                Write-Host "##[command]Validating Databricks has access to key vault - '[ $($vault.VaultName) ]'"
+
+                $kv = Get-AzKeyVault -VaultName $vault.VaultName
+                if ($kv.AccessPolicies.ObjectId -match "9c23bd41-1b0e-4668-8aad-f4f3dc36a1c0") {
+                  Write-Host "##[debug]Key vault - '[ $($vault.VaultName) ]' access policy is enabled for Databricks"
+                  $kv.AccessPolicies | Where-Object { $_.ObjectId -match "9c23bd41-1b0e-4668-8aad-f4f3dc36a1c0" }
+                }
+                else {
+                  Write-Host "##vso[task.logissue type=warning;]Key vault - '[ $($vault.VaultName) ]' access policy is NOT enabled for Databricks"
+                  Write-Host "##vso[task.complete result=SucceededWithIssues;]"
+                }
+              }
+            azurePowerShellVersion: 'LatestVersion'
+
+      - job: Logging
+        steps:
+        - checkout: none
+        - task: AzurePowerShell@5
+          displayName: Diagnostics Enabled
+          inputs:
+            azureSubscription: '$(serviceConnection)'
+            ScriptType: 'InlineScript'
+            Inline: |
+              # Make sure all resources have diagnostics enabled.
+              Write-Host "##[group]Validating Resource groups for environment - '[ ${{ parameters.environment }} ]'"
+
+              $diagnosticsEnabled = $null
+              $status = $null
+
+              $rgs = Get-AzResourceGroup | Where-Object { $_.ResourceGroupName -like "${{ parameters.environment }}-*" }
+              foreach ($rg in $rgs) {
+                $resources = Get-AzResource -ResourceGroupName $rg.ResourceGroupName
+
+                foreach ($resource in $resources) {
+                  Write-Host "##[command]Checking existence of diagnostics settings enabled for resource - '[ $($resource.Name) ]'"
+
+                  # Checks the Diagnostic Setting status for the current resource
+                  $status = Get-AzDiagnosticSetting -ResourceId $resource.Id -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
+
+                  # Condition checks if any of the Logs and / or Metrics are disabled in the Diagnostic Setting
+                  if ($status.Logs.Enabled -contains $false -or $status.Metrics.Enabled -contains $false) {
+                    $diagnosticsEnabled = $false
+                    $status = "NOT ENABLED"
+                    $message = "##vso[task.logissue type=warning;]"
+                    Write-Host "##vso[task.complete result=SucceededWithIssues;]"
+                  }
+                  else {
+                    $diagnosticsEnabled = $true
+                    $status = "ENABLED"
+                    $message = "##[debug]"
+                  }
+
+                  Write-Host "$($message) Diagnostics STATUS for resource - '[ $($resource.Name) ]' : $status"
+                }
+              }
+              Write-Host "##[endgroup]"
+            azurePowerShellVersion: 'LatestVersion'
+
+# - stage: Destroy_Environment
+#   condition: eq('${{ parameters.teardown }}', 'true')
+#   jobs:
+#   - template: pipeline.jobs.teardown.yaml
+#     parameters:
+#       location: '${{ parameters.region }}'
+#       environment: '${{ parameters.environment }}'
+#       appPrefix: '${{ parameters.appPrefix }}'
+#       vmImage: '$(vmImage)'
+#       serviceConnection: '$(serviceConnection)'
+  ######## DEPLOY APP INFRA ########
+  # Deploy application infrastructure - databricks, datafactory, key vaults, storage ..etc
+  - stage: Deploy_Recovery_vault-trisha
+    displayName: Deploy Recovery vault infra
+    condition: |
+      and
+      (
+        eq('${{ parameters.component }}', 'rsv'),
+        eq(dependencies.PreDeploy.result, 'Succeeded')
+      )
+    dependsOn:
+    - PreDeploy
+
+    jobs:
+      - template: templates/pipeline.jobs.rsv.yaml
+        parameters:
+          appPrefix: "$(appPrefix)"
+          environmentName: "$(environmentName)"
+          location: "$(region)"
+          serviceConnection: "$(serviceConnection)"
+          subscriptionId: "$(subscriptionId)"
+          vmImage: "$(vmImage)"
